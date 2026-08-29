@@ -105,3 +105,44 @@ ESP32-S3
 → dashboard
 
 Future backend/database options can include PostgreSQL or SQLite with FastAPI, while Firebase can remain the realtime transport for the prototype.
+
+## Firebase live-value test
+
+This build has **no random/demo telemetry generator**. The dashboard waits for Firebase data.
+
+The default Realtime Database path is:
+
+`devices/esp32s3_001/live`
+
+For a first test, create that node in Firebase Realtime Database and paste a JSON object such as:
+
+```json
+{
+  "state": "LISTENING",
+  "confidence": 12.4,
+  "threshold": 85,
+  "detectionsToday": 18,
+  "falseActivations": 0,
+  "lastDetection": "--:--:--",
+  "inferenceMs": 4.7,
+  "wakeLatencyMs": 85,
+  "voltage": 3.30,
+  "currentMa": 6.0,
+  "powerMw": 19.8,
+  "cpuPercent": 6.2,
+  "ramUsedKb": 147,
+  "ramLimitKb": 256
+}
+```
+
+Then edit one value in Firebase, for example `powerMw` from `19.8` to `25.0`. The deployed page should update automatically through the Realtime Database listener.
+
+You can also test the wake indicator by changing:
+
+`state: "LISTENING"`
+
+to:
+
+`state: "WAKE DETECTED"`
+
+The dashboard will switch its KWS indicator to **KEYWORD DETECTED**.
