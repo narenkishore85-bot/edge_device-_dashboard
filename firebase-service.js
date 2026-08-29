@@ -1,4 +1,6 @@
 /* Firebase adapter. Keep this file isolated so a future REST/FastAPI adapter can replace it. */
+import firebaseConfig from "./firebase-config.js";
+
 window.EdgeKWSFirebase = (() => {
   let db = null;
   function validConfig(){
