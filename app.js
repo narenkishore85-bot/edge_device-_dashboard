@@ -1,14 +1,38 @@
 /*
- * EdgeKWS — Firebase Live Data Layer
+ * ============================================================
+ * EdgeKWS — Firebase Live Dashboard
+ * ============================================================
  *
- * Data source:
+ * DATA FLOW:
+ *
+ * ESP32
+ *   ↓
+ * Wi-Fi
+ *   ↓
  * Firebase Realtime Database
+ *   ↓
+ * app.js
+ *   ↓
+ * Dashboard
  *
- * No random/demo telemetry is generated.
+ * IMPORTANT:
+ * - No random telemetry is generated here.
+ * - No power value is required in Firebase.
+ * - Power is calculated locally:
+ *
+ *       POWER (mW) = VOLTAGE (V) × CURRENT (mA)
  *
  * Firebase path:
- * devices/esp32s3_001/live
+ *
+ * devices/{deviceId}/live
+ *
+ * ============================================================
  */
+
+
+/* ============================================================
+   CENTRAL SYSTEM DATA
+   ============================================================ */
 
 const systemData = {
 
@@ -19,32 +43,52 @@ const systemData = {
     cpuPercent: 0,
 
     ramUsedKb: 0,
+
     ramLimitKb: 256,
 
     voltage: 0,
+
     currentMa: 0,
-    powerMw: 0,
 
     inferenceMs: 0,
+
     wakeLatencyMs: 0,
 
     confidence: 0,
+
     threshold: 85,
 
-    state: "WAITING",
+    state: "WAITING FOR FIREBASE",
 
     detectionsToday: 0,
+
     falseActivations: 0,
 
     lastDetection: "--:--:--",
 
+    /*
+     * These exist ONLY inside the browser.
+     *
+     * They are NOT required in Firebase.
+     */
+
     powerHistory: [],
+
     timeLabels: []
+
 };
 
 
+/* ============================================================
+   DOM HELPER
+   ============================================================ */
+
 const $ = id => document.getElementById(id);
 
+
+/* ============================================================
+   NUMBER FORMATTER
+   ============================================================ */
 
 const fmt = (value, decimals = 1) => {
 
@@ -53,317 +97,113 @@ const fmt = (value, decimals = 1) => {
     return Number.isFinite(number)
         ? number.toFixed(decimals)
         : "--";
+
 };
 
 
-let powerChart = null;
+/* ============================================================
+   POWER CALCULATION
+   ============================================================ */
+
+function calculatePower() {
+
+    const voltage = Number(systemData.voltage);
+
+    const current = Number(systemData.currentMa);
 
 
-/* ---------------------------------------------------------
-   DATA SOURCE
---------------------------------------------------------- */
+    /*
+     * V × mA = mW
+     */
 
-function sourceLabel() {
+    if (
+        !Number.isFinite(voltage) ||
+        !Number.isFinite(current)
+    ) {
 
-    return systemData.mode === "firebase"
-        ? "FIREBASE LIVE"
-        : "WAITING";
+        return 0;
+
+    }
+
+
+    return voltage * current;
+
 }
 
 
-/* ---------------------------------------------------------
-   POWER HISTORY
---------------------------------------------------------- */
+/* ============================================================
+   POWER GRAPH SAMPLE
+   ============================================================ */
 
 function appendPowerSample(power) {
 
     const value = Number(power);
 
-    if (!Number.isFinite(value)) return;
+
+    if (!Number.isFinite(value)) {
+
+        return;
+
+    }
+
 
     const now = new Date();
 
+
     systemData.powerHistory.push(value);
 
+
     systemData.timeLabels.push(
-        now.toLocaleTimeString([], {
-            hour12: false
-        })
+
+        now.toLocaleTimeString(
+            [],
+            {
+                hour12: false
+            }
+        )
+
     );
 
 
     /*
-     * Keep only the latest 30 samples.
+     * Keep the last 30 samples.
      */
 
-    if (systemData.powerHistory.length > 30) {
+    if (
+        systemData.powerHistory.length > 30
+    ) {
 
         systemData.powerHistory.shift();
 
         systemData.timeLabels.shift();
+
     }
+
 }
 
 
-/* ---------------------------------------------------------
-   NORMALIZE STATE
---------------------------------------------------------- */
-
-function normalizeState(value) {
-
-    if (!value) {
-        return "WAITING";
-    }
-
-
-    const state = String(value)
-        .trim()
-        .toUpperCase()
-        .replace(/-/g, "_")
-        .replace(/\s+/g, "_");
-
-
-    /*
-     * Supported ESP32 states
-     */
-
-    if (
-        state === "LISTENING" ||
-        state === "IDLE_LISTENING"
-    ) {
-        return "LISTENING";
-    }
-
-
-    if (
-        state === "WAKE_DETECTED" ||
-        state === "WAKE_DETECT" ||
-        state === "WAKE"
-    ) {
-        return "WAKE_DETECTED";
-    }
-
-
-    if (
-        state === "STREAMING" ||
-        state === "ASR_STREAMING"
-    ) {
-        return "STREAMING";
-    }
-
-
-    if (
-        state === "OFFLINE"
-    ) {
-        return "OFFLINE";
-    }
-
-
-    /*
-     * Unknown state.
-     */
-
-    return state;
-}
-
-
-/* ---------------------------------------------------------
-   UPDATE STATE UI
---------------------------------------------------------- */
-
-function updateStateUI() {
-
-    const state = normalizeState(systemData.state);
-
-
-    /*
-     * LISTENING
-     */
-
-    if (state === "LISTENING") {
-
-        $("kwsState").textContent = "LISTENING";
-
-        $("kwsBadge").textContent = "LISTENING";
-
-        $("modePill").textContent = "IDLE LISTENING";
-
-        $("signalState").textContent = "DECISION";
-
-        $("eventSignal").textContent = "ARMED";
-
-        $("eventText").textContent =
-            "LISTENING FOR WAKE PHRASE";
-
-        $("eventSubtext").textContent =
-            "No keyword event detected";
-
-        $("eventIndicator").classList.remove("detected");
-
-        $("reactor").classList.remove("detected");
-
-        return;
-    }
-
-
-    /*
-     * WAKE DETECTED
-     */
-
-    if (state === "WAKE_DETECTED") {
-
-        $("kwsState").textContent =
-            "WAKE DETECTED";
-
-        $("kwsBadge").textContent =
-            "WAKE DETECTED";
-
-        $("modePill").textContent =
-            "WAKE EVENT ACTIVE";
-
-        $("signalState").textContent =
-            "WAKE EVENT";
-
-        $("eventSignal").textContent =
-            "TRIGGERED";
-
-        $("eventText").textContent =
-            "KEYWORD DETECTED — START ASR";
-
-        $("eventSubtext").textContent =
-            `Confidence ${fmt(systemData.confidence)}%`;
-
-        $("eventIndicator").classList.add("detected");
-
-        $("reactor").classList.add("detected");
-
-        return;
-    }
-
-
-    /*
-     * STREAMING
-     */
-
-    if (state === "STREAMING") {
-
-        $("kwsState").textContent =
-            "STREAMING";
-
-        $("kwsBadge").textContent =
-            "ASR STREAMING";
-
-        $("modePill").textContent =
-            "AUDIO STREAMING";
-
-        $("signalState").textContent =
-            "STREAMING";
-
-        $("eventSignal").textContent =
-            "ASR ACTIVE";
-
-        $("eventText").textContent =
-            "AUDIO STREAMING TO ASR";
-
-        $("eventSubtext").textContent =
-            "Wake phrase detected — remote ASR active";
-
-        $("eventIndicator").classList.add("detected");
-
-        $("reactor").classList.add("detected");
-
-        return;
-    }
-
-
-    /*
-     * OFFLINE
-     */
-
-    if (state === "OFFLINE") {
-
-        $("kwsState").textContent =
-            "OFFLINE";
-
-        $("kwsBadge").textContent =
-            "OFFLINE";
-
-        $("modePill").textContent =
-            "DEVICE OFFLINE";
-
-        $("signalState").textContent =
-            "NO SIGNAL";
-
-        $("eventSignal").textContent =
-            "OFFLINE";
-
-        $("eventText").textContent =
-            "ESP32-S3 OFFLINE";
-
-        $("eventSubtext").textContent =
-            "No active telemetry";
-
-        $("eventIndicator").classList.remove("detected");
-
-        $("reactor").classList.remove("detected");
-
-        return;
-    }
-
-
-    /*
-     * Unknown / waiting state
-     */
-
-    $("kwsState").textContent =
-        state.replace(/_/g, " ");
-
-    $("kwsBadge").textContent =
-        state.replace(/_/g, " ");
-
-    $("modePill").textContent =
-        state.replace(/_/g, " ");
-
-    $("signalState").textContent =
-        "DECISION";
-
-    $("eventSignal").textContent =
-        "ARMED";
-
-    $("eventText").textContent =
-        "WAITING FOR KWS STATE";
-
-    $("eventSubtext").textContent =
-        `Firebase state: ${state}`;
-
-    $("eventIndicator").classList.remove("detected");
-
-    $("reactor").classList.remove("detected");
-}
-
-
-/* ---------------------------------------------------------
+/* ============================================================
    APPLY FIREBASE DATA
---------------------------------------------------------- */
+   ============================================================ */
 
 function applyData(incoming = {}) {
 
-    Object.assign(systemData, incoming);
+    /*
+     * Copy Firebase values into our central data object.
+     */
+
+    Object.assign(
+        systemData,
+        incoming
+    );
+
 
     systemData.mode = "firebase";
 
 
-    /*
-     * Normalize Firebase state.
-     */
-
-    systemData.state =
-        normalizeState(systemData.state);
-
-
-    /*
-     * RAM percentage
-     */
+    /* ========================================================
+       RAM PERCENTAGE
+       ======================================================== */
 
     const ramLimit =
         Number(systemData.ramLimitKb);
@@ -378,55 +218,112 @@ function applyData(incoming = {}) {
             : 0;
 
 
-    /* -----------------------------------------------------
-       CONNECTION
-    ----------------------------------------------------- */
+    /* ========================================================
+       STATE
+       ======================================================== */
+
+    const currentState =
+        String(
+            systemData.state || ""
+        ).toUpperCase();
+
+
+    const listening =
+        currentState === "LISTENING";
+
+
+    const wakeDetected =
+        currentState === "WAKE_DETECTED" ||
+        currentState === "WAKE DETECTED";
+
+
+    const streaming =
+        currentState === "STREAMING";
+
+
+    /* ========================================================
+       POWER
+       ======================================================== */
+
+    const calculatedPower =
+        calculatePower();
+
+
+    /*
+     * Store calculated power locally.
+     *
+     * This does NOT send it back to Firebase.
+     */
+
+    systemData.powerMw =
+        calculatedPower;
+
+
+    /* ========================================================
+       BASIC CONNECTION UI
+       ======================================================== */
 
     $("deviceId").textContent =
         systemData.deviceId;
 
+
     $("sideLink").textContent =
-        sourceLabel();
+        "FIREBASE LIVE";
+
 
     $("sideSource").textContent =
-        sourceLabel();
+        "FIREBASE LIVE";
+
 
     $("linkStatus").textContent =
         "LIVE";
 
+
     $("footerMode").textContent =
         "FIREBASE LIVE";
+
 
     $("connectionBadge").textContent =
         "LIVE";
 
+
     $("frontendMode").textContent =
         "FIREBASE LIVE";
+
 
     $("firebasePath").textContent =
         `devices/${systemData.deviceId}/live`;
 
+
     $("telemetryUpdate").textContent =
-        new Date().toLocaleTimeString([], {
-            hour12: false
-        });
+        new Date().toLocaleTimeString(
+            [],
+            {
+                hour12: false
+            }
+        );
 
 
-    /* -----------------------------------------------------
+    /* ========================================================
        CPU
-    ----------------------------------------------------- */
+       ======================================================== */
+
+    $("cpu").textContent =
+        fmt(
+            systemData.cpuPercent
+        ) + "%";
+
 
     const cpu =
         Number(systemData.cpuPercent);
 
 
-    $("cpu").textContent =
-        fmt(cpu) + "%";
-
-
     $("cpuBar").style.width =
         Math.min(
-            Math.max(cpu * 10, 0),
+            Math.max(
+                cpu * 10,
+                0
+            ),
             100
         ) + "%";
 
@@ -437,102 +334,146 @@ function applyData(incoming = {}) {
             : "TARGET STATUS // ABOVE LIMIT";
 
 
-    /* -----------------------------------------------------
+    /* ========================================================
        RAM
-    ----------------------------------------------------- */
+       ======================================================== */
 
     $("ram").textContent =
-        fmt(ramUsed, 0);
+        fmt(
+            systemData.ramUsedKb,
+            0
+        );
 
 
     $("ramPercent").textContent =
-        fmt(ramPct) + "%";
+        fmt(
+            ramPct
+        ) + "%";
 
 
     $("ramBar").style.width =
         Math.min(
-            Math.max(ramPct, 0),
+            Math.max(
+                ramPct,
+                0
+            ),
             100
         ) + "%";
 
 
-    /* -----------------------------------------------------
-       POWER
-    ----------------------------------------------------- */
+    /* ========================================================
+       VOLTAGE
+       ======================================================== */
 
-    const power =
-        Number(systemData.powerMw);
+    $("voltage").textContent =
+        fmt(
+            systemData.voltage,
+            2
+        ) + " V";
 
-    const voltage =
-        Number(systemData.voltage);
 
-    const current =
-        Number(systemData.currentMa);
+    /* ========================================================
+       CURRENT
+       ======================================================== */
 
+    $("current").textContent =
+        fmt(
+            systemData.currentMa
+        ) + " mA";
+
+
+    /* ========================================================
+       CALCULATED POWER
+       ======================================================== */
 
     $("power").textContent =
-        fmt(power);
+        fmt(
+            calculatedPower
+        );
 
 
     $("powerFormula").textContent =
-        fmt(power);
-
-
-    $("voltage").textContent =
-        fmt(voltage, 2) + " V";
-
-
-    $("current").textContent =
-        fmt(current) + " mA";
+        fmt(
+            calculatedPower
+        );
 
 
     $("powerFormulaText").textContent =
-        `${fmt(voltage, 2)} V × ${fmt(current)} mA`;
+        `${fmt(systemData.voltage, 2)} V × ${fmt(systemData.currentMa)} mA`;
 
 
-    /* -----------------------------------------------------
-       KWS PERFORMANCE
-    ----------------------------------------------------- */
+    /* ========================================================
+       INFERENCE
+       ======================================================== */
 
     $("inference").textContent =
-        fmt(systemData.inferenceMs);
+        fmt(
+            systemData.inferenceMs
+        );
 
 
     $("latency").textContent =
-        fmt(systemData.inferenceMs);
+        fmt(
+            systemData.inferenceMs
+        );
+
+
+    /* ========================================================
+       CONFIDENCE
+       ======================================================== */
+
+    const confidence =
+        Number(
+            systemData.confidence
+        );
 
 
     $("confidence").textContent =
-        fmt(systemData.confidence) + "%";
+        fmt(
+            confidence
+        ) + "%";
 
 
     $("confidenceBar").style.width =
         Math.min(
             Math.max(
-                Number(systemData.confidence),
+                confidence,
                 0
             ),
             100
         ) + "%";
 
 
+    /* ========================================================
+       THRESHOLD
+       ======================================================== */
+
+    const threshold =
+        Number(
+            systemData.threshold
+        );
+
+
     $("threshold").textContent =
-        fmt(systemData.threshold, 0) + "%";
+        fmt(
+            threshold,
+            0
+        ) + "%";
 
 
     $("thresholdMark").style.left =
         Math.min(
             Math.max(
-                Number(systemData.threshold),
+                threshold,
                 0
             ),
             100
         ) + "%";
 
 
-    /* -----------------------------------------------------
+    /* ========================================================
        DETECTIONS
-    ----------------------------------------------------- */
+       ======================================================== */
 
     $("detections").textContent =
         systemData.detectionsToday ?? 0;
@@ -543,101 +484,315 @@ function applyData(incoming = {}) {
 
 
     $("lastDetection").textContent =
-        systemData.lastDetection || "--:--:--";
+        systemData.lastDetection ||
+        "--:--:--";
 
 
-    /* -----------------------------------------------------
-       STATE
-    ----------------------------------------------------- */
+    /* ========================================================
+       KWS STATE
+       ======================================================== */
 
-    updateStateUI();
+    let displayState = "LISTENING";
 
 
-    /* -----------------------------------------------------
-       DATA STATUS
-    ----------------------------------------------------- */
+    if (wakeDetected) {
+
+        displayState =
+            "WAKE DETECTED";
+
+    }
+
+    else if (streaming) {
+
+        displayState =
+            "STREAMING";
+
+    }
+
+    else if (listening) {
+
+        displayState =
+            "LISTENING";
+
+    }
+
+    else {
+
+        /*
+         * Show whatever state Firebase sent.
+         */
+
+        displayState =
+            currentState || "WAITING";
+
+    }
+
+
+    $("kwsState").textContent =
+        displayState;
+
+
+    $("kwsBadge").textContent =
+        displayState;
+
+
+    /* ========================================================
+       MODE PILL
+       ======================================================== */
+
+    if (wakeDetected) {
+
+        $("modePill").textContent =
+            "WAKE EVENT ACTIVE";
+
+    }
+
+    else if (streaming) {
+
+        $("modePill").textContent =
+            "ASR STREAMING";
+
+    }
+
+    else {
+
+        $("modePill").textContent =
+            "IDLE LISTENING";
+
+    }
+
+
+    /* ========================================================
+       SIGNAL STATE
+       ======================================================== */
+
+    if (wakeDetected) {
+
+        $("signalState").textContent =
+            "WAKE EVENT";
+
+    }
+
+    else if (streaming) {
+
+        $("signalState").textContent =
+            "STREAMING";
+
+    }
+
+    else {
+
+        $("signalState").textContent =
+            "DECISION";
+
+    }
+
+
+    /* ========================================================
+       EVENT SIGNAL
+       ======================================================== */
+
+    if (wakeDetected) {
+
+        $("eventSignal").textContent =
+            "TRIGGERED";
+
+    }
+
+    else if (streaming) {
+
+        $("eventSignal").textContent =
+            "STREAMING";
+
+    }
+
+    else {
+
+        $("eventSignal").textContent =
+            "ARMED";
+
+    }
+
+
+    /* ========================================================
+       EVENT TEXT
+       ======================================================== */
+
+    if (wakeDetected) {
+
+        $("eventText").textContent =
+            "KEYWORD DETECTED — START ASR";
+
+
+        $("eventSubtext").textContent =
+            `Confidence ${fmt(confidence)}%`;
+
+    }
+
+    else if (streaming) {
+
+        $("eventText").textContent =
+            "AUDIO STREAMING TO ASR";
+
+
+        $("eventSubtext").textContent =
+            "Remote processing active";
+
+    }
+
+    else {
+
+        $("eventText").textContent =
+            "LISTENING FOR WAKE PHRASE";
+
+
+        $("eventSubtext").textContent =
+            "No keyword event detected";
+
+    }
+
+
+    /* ========================================================
+       VISUAL DETECTION STATE
+       ======================================================== */
+
+    $("eventIndicator")
+        .classList
+        .toggle(
+            "detected",
+            wakeDetected || streaming
+        );
+
+
+    $("reactor")
+        .classList
+        .toggle(
+            "detected",
+            wakeDetected || streaming
+        );
+
+
+    /* ========================================================
+       DEMO / LIVE BANNER
+       ======================================================== */
 
     $("demoBanner").innerHTML =
         "● FIREBASE LIVE TELEMETRY " +
         "<span>— values below are read directly from Firebase Realtime Database</span>";
 
 
-    /* -----------------------------------------------------
+    /* ========================================================
        POWER HISTORY
-    ----------------------------------------------------- */
+       ======================================================== */
+
+    /*
+     * Add the newly calculated power value.
+     */
 
     if (
-        Array.isArray(systemData.powerHistory) &&
-        systemData.powerHistory.length
+        Number.isFinite(
+            calculatedPower
+        )
     ) {
 
-        if (
-            !Array.isArray(systemData.timeLabels) ||
-            systemData.timeLabels.length !==
-            systemData.powerHistory.length
-        ) {
+        appendPowerSample(
+            calculatedPower
+        );
 
-            systemData.timeLabels =
-                systemData.powerHistory.map(
-                    (_, index) =>
-                        `P-${systemData.powerHistory.length - index - 1}`
-                );
-        }
     }
 
 
-    const history =
-        Array.isArray(systemData.powerHistory)
-            ? systemData.powerHistory
-            : [];
+    /* ========================================================
+       POWER STATISTICS
+       ======================================================== */
+
+    const powerValues =
+        systemData.powerHistory
+            .map(Number)
+            .filter(
+                Number.isFinite
+            );
 
 
-    if (history.length) {
+    if (
+        powerValues.length > 0
+    ) {
 
-        const numeric =
-            history
-                .map(Number)
-                .filter(Number.isFinite);
-
-
-        if (numeric.length) {
-
-            const avg =
-                numeric.reduce(
-                    (a, b) => a + b,
-                    0
-                ) / numeric.length;
+        const average =
+            powerValues.reduce(
+                (total, value) =>
+                    total + value,
+                0
+            ) /
+            powerValues.length;
 
 
-            $("powerAvg").textContent =
-                fmt(avg);
+        const minimum =
+            Math.min(
+                ...powerValues
+            );
 
 
-            $("powerRange").textContent =
-                `${fmt(Math.min(...numeric))}–${fmt(Math.max(...numeric))}`;
-        }
+        const maximum =
+            Math.max(
+                ...powerValues
+            );
 
-    } else {
 
         $("powerAvg").textContent =
-            fmt(power);
+            fmt(
+                average
+            );
+
+
+        $("powerRange").textContent =
+            `${fmt(minimum)}–${fmt(maximum)}`;
+
+    }
+
+    else {
+
+        $("powerAvg").textContent =
+            fmt(
+                calculatedPower
+            );
+
 
         $("powerRange").textContent =
             "--";
+
     }
 
 
+    /* ========================================================
+       UPDATE POWER CHART
+       ======================================================== */
+
     updatePowerChart();
+
 }
 
 
-/* ---------------------------------------------------------
+/* ============================================================
    POWER CHART
---------------------------------------------------------- */
+   ============================================================ */
+
+let powerChart = null;
+
+
+/* ============================================================
+   UPDATE POWER CHART
+   ============================================================ */
 
 function updatePowerChart() {
 
-    if (!powerChart) return;
+    if (
+        !powerChart
+    ) {
+
+        return;
+
+    }
 
 
     powerChart.data.labels =
@@ -648,13 +803,16 @@ function updatePowerChart() {
         systemData.powerHistory;
 
 
-    powerChart.update("none");
+    powerChart.update(
+        "none"
+    );
+
 }
 
 
-/* ---------------------------------------------------------
+/* ============================================================
    INITIALIZE POWER CHART
---------------------------------------------------------- */
+   ============================================================ */
 
 function initPowerChart() {
 
@@ -662,143 +820,201 @@ function initPowerChart() {
         $("powerChart");
 
 
-    if (!canvas || !window.Chart) {
+    if (
+        !canvas ||
+        !window.Chart
+    ) {
+
         return;
+
     }
 
 
-    powerChart = new Chart(
-        canvas.getContext("2d"),
-        {
+    powerChart =
+        new Chart(
+            canvas.getContext("2d"),
+            {
 
-            type: "line",
+                type: "line",
 
-            data: {
+                data: {
 
-                labels:
-                    systemData.timeLabels,
+                    labels:
+                        systemData.timeLabels,
 
-                datasets: [
+                    datasets: [
 
-                    {
+                        {
 
-                        label:
-                            "Power",
+                            label:
+                                "Power",
 
-                        data:
-                            systemData.powerHistory,
+                            data:
+                                systemData.powerHistory,
 
-                        borderColor:
-                            "#55f2a5",
+                            borderColor:
+                                "#55f2a5",
 
-                        backgroundColor:
-                            "rgba(85,242,165,.045)",
+                            backgroundColor:
+                                "rgba(85,242,165,.045)",
 
-                        borderWidth:
-                            2,
+                            borderWidth:
+                                2,
 
-                        pointRadius:
-                            2,
+                            pointRadius:
+                                2,
 
-                        pointHoverRadius:
-                            4,
+                            pointHoverRadius:
+                                4,
 
-                        fill:
-                            true,
+                            fill:
+                                true,
 
-                        tension:
-                            0.3
-                    }
+                            tension:
+                                0.3
 
-                ]
-            },
+                        }
 
+                    ]
 
-            options: {
-
-                responsive:
-                    true,
-
-                maintainAspectRatio:
-                    false,
-
-                animation:
-                    false,
-
-
-                plugins: {
-
-                    legend: {
-                        display: false
-                    },
-
-                    tooltip: {
-
-                        mode:
-                            "index",
-
-                        intersect:
-                            false
-                    }
                 },
 
 
-                scales: {
+                options: {
 
-                    x: {
+                    responsive:
+                        true,
 
-                        grid: {
-                            color:
-                                "rgba(57,220,255,.05)"
+                    maintainAspectRatio:
+                        false,
+
+                    animation:
+                        false,
+
+
+                    plugins: {
+
+                        legend: {
+
+                            display:
+                                false
+
                         },
 
-                        ticks: {
 
-                            color:
-                                "#4e6a75",
+                        tooltip: {
 
-                            font: {
-                                family:
-                                    "JetBrains Mono",
+                            mode:
+                                "index",
 
-                                size:
-                                    8
+                            intersect:
+                                false,
+
+                            callbacks: {
+
+                                label:
+                                    function(context) {
+
+                                        return (
+                                            " Power: " +
+                                            Number(
+                                                context.parsed.y
+                                            ).toFixed(2) +
+                                            " mW"
+                                        );
+
+                                    }
+
                             }
+
                         }
+
                     },
 
 
-                    y: {
+                    scales: {
 
-                        grid: {
-                            color:
-                                "rgba(57,220,255,.06)"
+                        x: {
+
+                            grid: {
+
+                                color:
+                                    "rgba(57,220,255,.05)"
+
+                            },
+
+                            ticks: {
+
+                                color:
+                                    "#4e6a75",
+
+                                font: {
+
+                                    family:
+                                        "JetBrains Mono",
+
+                                    size:
+                                        8
+
+                                }
+
+                            }
+
                         },
 
-                        ticks: {
 
-                            color:
-                                "#4e6a75",
+                        y: {
 
-                            font: {
-                                family:
-                                    "JetBrains Mono",
+                            grid: {
 
-                                size:
-                                    8
+                                color:
+                                    "rgba(57,220,255,.06)"
+
+                            },
+
+                            ticks: {
+
+                                color:
+                                    "#4e6a75",
+
+                                font: {
+
+                                    family:
+                                        "JetBrains Mono",
+
+                                    size:
+                                        8
+
+                                },
+
+                                callback:
+                                    function(value) {
+
+                                        return (
+                                            value +
+                                            " mW"
+                                        );
+
+                                    }
+
                             }
+
                         }
+
                     }
+
                 }
+
             }
-        }
-    );
+
+        );
+
 }
 
 
-/* ---------------------------------------------------------
+/* ============================================================
    CLOCK
---------------------------------------------------------- */
+   ============================================================ */
 
 function updateClock() {
 
@@ -807,262 +1023,388 @@ function updateClock() {
 
 
     $("clock").textContent =
-        now.toLocaleTimeString([], {
-            hour12: false
-        });
+        now.toLocaleTimeString(
+            [],
+            {
+                hour12: false
+            }
+        );
 
 
     $("date").textContent =
-        now.toLocaleDateString([], {
+        now.toLocaleDateString(
+            [],
+            {
+                month: "short",
 
-            month:
-                "short",
+                day: "2-digit",
 
-            day:
-                "2-digit",
+                year: "numeric"
 
-            year:
-                "numeric"
-        });
+            }
+        );
+
 }
 
 
-/* ---------------------------------------------------------
+/* ============================================================
    NAVIGATION
---------------------------------------------------------- */
+   ============================================================ */
 
 function initNavigation() {
 
     document
         .querySelectorAll(".nav-item")
-        .forEach(button => {
+        .forEach(
+            button => {
 
-            button.addEventListener(
-                "click",
-                () => {
+                button.addEventListener(
+                    "click",
+                    () => {
 
-                    document
-                        .querySelectorAll(".nav-item")
-                        .forEach(item =>
-                            item.classList.remove("active")
+                        document
+                            .querySelectorAll(
+                                ".nav-item"
+                            )
+                            .forEach(
+                                item =>
+                                    item.classList.remove(
+                                        "active"
+                                    )
+                            );
+
+
+                        document
+                            .querySelectorAll(
+                                ".page"
+                            )
+                            .forEach(
+                                page =>
+                                    page.classList.remove(
+                                        "active"
+                                    )
+                            );
+
+
+                        button.classList.add(
+                            "active"
                         );
 
 
-                    document
-                        .querySelectorAll(".page")
-                        .forEach(page =>
-                            page.classList.remove("active")
-                        );
+                        const page =
+                            $("page-" +
+                              button.dataset.page);
 
 
-                    button.classList.add("active");
+                        if (page) {
+
+                            page.classList.add(
+                                "active"
+                            );
+
+                        }
 
 
-                    const page =
-                        $("page-" + button.dataset.page);
+                        $("sidebar")
+                            .classList
+                            .remove(
+                                "open"
+                            );
 
-
-                    if (page) {
-                        page.classList.add("active");
                     }
+                );
+
+            }
+        );
 
 
-                    $("sidebar")
-                        .classList
-                        .remove("open");
-                }
-            );
-        });
+    const mobileMenu =
+        $("mobileMenu");
 
 
-    $("mobileMenu").addEventListener(
-        "click",
-        () =>
-            $("sidebar")
-                .classList
-                .toggle("open")
-    );
+    if (mobileMenu) {
+
+        mobileMenu.addEventListener(
+            "click",
+            () => {
+
+                $("sidebar")
+                    .classList
+                    .toggle(
+                        "open"
+                    );
+
+            }
+        );
+
+    }
+
 }
 
 
-/* ---------------------------------------------------------
+/* ============================================================
    FIREBASE CONNECTION
---------------------------------------------------------- */
+   ============================================================ */
+
+async function initializeFirebase() {
+
+    if (
+        !window.EdgeKWSFirebase
+    ) {
+
+        console.warn(
+            "EdgeKWSFirebase adapter not found."
+        );
+
+        $("demoBanner").innerHTML =
+            "! FIREBASE ADAPTER NOT FOUND " +
+            "<span>— check firebase-service.js</span>";
+
+
+        $("connectionBadge").textContent =
+            "ERROR";
+
+
+        $("frontendMode").textContent =
+            "ADAPTER ERROR";
+
+
+        $("linkStatus").textContent =
+            "ERROR";
+
+
+        return;
+
+    }
+
+
+    try {
+
+        const connected =
+            await window.EdgeKWSFirebase.connect(
+
+                systemData.deviceId,
+
+                data => {
+
+                    /*
+                     * Firebase sent new telemetry.
+                     */
+
+                    if (!data) {
+
+                        return;
+
+                    }
+
+
+                    /*
+                     * Copy Firebase data.
+                     *
+                     * No random/demo data is added.
+                     */
+
+                    const incoming =
+                        {
+                            ...data
+                        };
+
+
+                    /*
+                     * Convert numeric fields safely.
+                     */
+
+                    const numericFields = [
+
+                        "cpuPercent",
+
+                        "ramUsedKb",
+
+                        "ramLimitKb",
+
+                        "voltage",
+
+                        "currentMa",
+
+                        "inferenceMs",
+
+                        "wakeLatencyMs",
+
+                        "confidence",
+
+                        "threshold",
+
+                        "detectionsToday",
+
+                        "falseActivations"
+
+                    ];
+
+
+                    numericFields.forEach(
+                        field => {
+
+                            if (
+                                incoming[field] !== undefined &&
+                                incoming[field] !== null &&
+                                incoming[field] !== ""
+                            ) {
+
+                                const value =
+                                    Number(
+                                        incoming[field]
+                                    );
+
+
+                                if (
+                                    Number.isFinite(
+                                        value
+                                    )
+                                ) {
+
+                                    incoming[field] =
+                                        value;
+
+                                }
+
+                            }
+
+                        }
+                    );
+
+
+                    /*
+                     * IMPORTANT:
+                     *
+                     * We deliberately do NOT read:
+                     *
+                     * incoming.powerMw
+                     *
+                     * because power is calculated from:
+                     *
+                     * voltage × currentMa
+                     */
+
+
+                    applyData(
+                        incoming
+                    );
+
+                }
+
+            );
+
+
+        if (!connected) {
+
+            $("demoBanner").innerHTML =
+                "! FIREBASE NOT CONFIGURED " +
+                "<span>— check firebase-config.js</span>";
+
+
+            $("connectionBadge").textContent =
+                "OFFLINE";
+
+
+            $("frontendMode").textContent =
+                "CONFIG REQUIRED";
+
+
+            $("linkStatus").textContent =
+                "OFFLINE";
+
+
+            $("sideLink").textContent =
+                "OFFLINE";
+
+
+            $("sideSource").textContent =
+                "NOT CONNECTED";
+
+
+            return;
+
+        }
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Firebase connection failed:",
+            error
+        );
+
+
+        $("demoBanner").innerHTML =
+            "! FIREBASE CONNECTION ERROR " +
+            "<span>— check Firebase configuration and database rules</span>";
+
+
+        $("connectionBadge").textContent =
+            "ERROR";
+
+
+        $("frontendMode").textContent =
+            "CONNECTION ERROR";
+
+
+        $("linkStatus").textContent =
+            "ERROR";
+
+
+        $("sideLink").textContent =
+            "ERROR";
+
+
+        $("sideSource").textContent =
+            "FIREBASE ERROR";
+
+    }
+
+}
+
+
+/* ============================================================
+   APPLICATION START
+   ============================================================ */
 
 window.addEventListener(
     "load",
     async () => {
 
+        /*
+         * Navigation
+         */
+
         initNavigation();
 
+
+        /*
+         * Clock
+         */
+
         updateClock();
+
 
         setInterval(
             updateClock,
             1000
         );
 
+
+        /*
+         * Chart
+         */
+
         initPowerChart();
 
 
         /*
-         * Firebase service should already be
-         * available from firebase-service.js.
+         * Firebase
          */
 
-        if (!window.EdgeKWSFirebase) {
+        await initializeFirebase();
 
-            console.error(
-                "EdgeKWS: Firebase service not available."
-            );
-
-            $("demoBanner").innerHTML =
-                "! FIREBASE SERVICE NOT LOADED " +
-                "<span>— check firebase-service.js</span>";
-
-            $("connectionBadge").textContent =
-                "ERROR";
-
-            $("frontendMode").textContent =
-                "SERVICE ERROR";
-
-            $("linkStatus").textContent =
-                "ERROR";
-
-            return;
-        }
-
-
-        try {
-
-            const connected =
-                await window.EdgeKWSFirebase.connect(
-
-                    systemData.deviceId,
-
-                    /*
-                     * Firebase data callback
-                     */
-
-                    data => {
-
-                        if (!data) return;
-
-
-                        const incoming =
-                            { ...data };
-
-
-                        /*
-                         * Add a power sample when
-                         * Firebase sends powerMw.
-                         */
-
-                        if (
-                            Number.isFinite(
-                                Number(incoming.powerMw)
-                            )
-                        ) {
-
-                            appendPowerSample(
-                                incoming.powerMw
-                            );
-                        }
-
-
-                        /*
-                         * If Firebase itself provides
-                         * historical power data,
-                         * use it.
-                         */
-
-                        if (
-                            Array.isArray(
-                                data.powerHistory
-                            )
-                        ) {
-
-                            incoming.powerHistory =
-                                data.powerHistory
-                                    .map(Number)
-                                    .filter(
-                                        Number.isFinite
-                                    );
-
-
-                            incoming.timeLabels =
-                                Array.isArray(
-                                    data.timeLabels
-                                )
-                                    ? data.timeLabels
-                                    : [];
-                        }
-
-
-                        /*
-                         * Update entire dashboard.
-                         */
-
-                        applyData(incoming);
-                    },
-
-
-                    /*
-                     * Firebase error callback
-                     */
-
-                    error => {
-
-                        console.error(
-                            "Firebase telemetry error:",
-                            error
-                        );
-                    }
-                );
-
-
-            if (!connected) {
-
-                $("demoBanner").innerHTML =
-                    "! FIREBASE NOT CONFIGURED " +
-                    "<span>— check firebase-config.js</span>";
-
-
-                $("connectionBadge").textContent =
-                    "OFFLINE";
-
-
-                $("frontendMode").textContent =
-                    "CONFIG REQUIRED";
-
-
-                $("linkStatus").textContent =
-                    "OFFLINE";
-            }
-
-        } catch (error) {
-
-            console.error(
-                "Firebase connection failed:",
-                error
-            );
-
-
-            $("demoBanner").innerHTML =
-                "! FIREBASE CONNECTION ERROR " +
-                "<span>— check Firebase configuration and Realtime Database rules</span>";
-
-
-            $("connectionBadge").textContent =
-                "ERROR";
-
-
-            $("frontendMode").textContent =
-                "CONNECTION ERROR";
-
-
-            $("linkStatus").textContent =
-                "ERROR";
-        }
     }
 );
