@@ -1,37 +1,41 @@
 /*
  * ============================================================
- * EdgeKWS — Firebase Live Dashboard
+ * EdgeKWS — Firebase Live Telemetry Dashboard
  * ============================================================
  *
- * DATA FLOW:
+ * SOURCE OF TRUTH:
  *
  * ESP32
- *   ↓
- * Wi-Fi
- *   ↓
+ *   ↓ Wi-Fi
  * Firebase Realtime Database
+ *   ↓
+ * firebase-service.js
  *   ↓
  * app.js
  *   ↓
  * Dashboard
  *
  * IMPORTANT:
- * - No random telemetry is generated here.
- * - No power value is required in Firebase.
- * - Power is calculated locally:
  *
- *       POWER (mW) = VOLTAGE (V) × CURRENT (mA)
+ * 1. No random telemetry is generated.
+ * 2. State comes directly from Firebase.
+ * 3. Mic status comes directly from Firebase when available.
+ * 4. Confidence comes directly from Firebase.
+ * 5. Power is calculated locally:
  *
- * Firebase path:
+ *       Power (mW) = Voltage (V) × Current (mA)
  *
- * devices/{deviceId}/live
+ * 6. Last update uses the ESP32/Firebase timestamp when
+ *    available instead of the browser clock.
+ *
+ * 7. The ESP32 does NOT need to generate graph data.
  *
  * ============================================================
  */
 
 
 /* ============================================================
-   CENTRAL SYSTEM DATA
+   CENTRAL TELEMETRY OBJECT
    ============================================================ */
 
 const systemData = {
@@ -60,6 +64,8 @@ const systemData = {
 
     state: "WAITING FOR FIREBASE",
 
+    micStatus: "UNKNOWN",
+
     detectionsToday: 0,
 
     falseActivations: 0,
@@ -67,14 +73,24 @@ const systemData = {
     lastDetection: "--:--:--",
 
     /*
-     * These exist ONLY inside the browser.
-     *
-     * They are NOT required in Firebase.
+     * Actual telemetry timestamp received from ESP32/Firebase.
      */
+    timestamp: null,
 
+    /*
+     * Browser-side graph history.
+     *
+     * These do NOT need to exist in Firebase.
+     */
     powerHistory: [],
 
-    timeLabels: []
+    timeLabels: [],
+
+    /*
+     * Used to avoid adding the same Firebase update
+     * to the graph multiple times.
+     */
+    lastSampleKey: null
 
 };
 
@@ -90,15 +106,38 @@ const $ = id => document.getElementById(id);
    NUMBER FORMATTER
    ============================================================ */
 
-const fmt = (value, decimals = 1) => {
+function fmt(value, decimals = 1) {
 
     const number = Number(value);
 
-    return Number.isFinite(number)
-        ? number.toFixed(decimals)
-        : "--";
+    if (!Number.isFinite(number)) {
 
-};
+        return "--";
+
+    }
+
+    return number.toFixed(decimals);
+
+}
+
+
+/* ============================================================
+   SAFE TEXT UPDATE
+   ============================================================ */
+
+function setText(id, value) {
+
+    const element = $(id);
+
+    if (!element) {
+
+        return;
+
+    }
+
+    element.textContent = value;
+
+}
 
 
 /* ============================================================
@@ -107,14 +146,12 @@ const fmt = (value, decimals = 1) => {
 
 function calculatePower() {
 
-    const voltage = Number(systemData.voltage);
+    const voltage =
+        Number(systemData.voltage);
 
-    const current = Number(systemData.currentMa);
+    const current =
+        Number(systemData.currentMa);
 
-
-    /*
-     * V × mA = mW
-     */
 
     if (
         !Number.isFinite(voltage) ||
@@ -126,50 +163,247 @@ function calculatePower() {
     }
 
 
+    /*
+     * V × mA = mW
+     */
+
     return voltage * current;
 
 }
 
 
 /* ============================================================
-   POWER GRAPH SAMPLE
+   NORMALIZE STATE
    ============================================================ */
 
-function appendPowerSample(power) {
+function normalizeState(value) {
 
-    const value = Number(power);
+    if (
+        value === undefined ||
+        value === null
+    ) {
+
+        return "WAITING";
+
+    }
 
 
-    if (!Number.isFinite(value)) {
+    return String(value)
+        .trim()
+        .toUpperCase()
+        .replace(/-/g, "_");
+
+}
+
+
+/* ============================================================
+   NORMALIZE MICROPHONE STATUS
+   ============================================================ */
+
+function getMicStatus() {
+
+    /*
+     * Prefer an actual micStatus value from Firebase.
+     */
+
+    if (
+        systemData.micStatus &&
+        systemData.micStatus !== "UNKNOWN"
+    ) {
+
+        return String(
+            systemData.micStatus
+        ).toUpperCase();
+
+    }
+
+
+    /*
+     * If ESP32 doesn't currently send micStatus,
+     * infer only the obvious cases.
+     *
+     * This is a fallback — actual micStatus is preferred.
+     */
+
+    const state =
+        normalizeState(
+            systemData.state
+        );
+
+
+    if (
+        state === "WAITING" ||
+        state === "WAITING_FOR_FIREBASE"
+    ) {
+
+        return "OFFLINE";
+
+    }
+
+
+    if (
+        state === "MIC_ERROR" ||
+        state === "ERROR"
+    ) {
+
+        return "ERROR";
+
+    }
+
+
+    return "ACTIVE";
+
+}
+
+
+/* ============================================================
+   TELEMETRY TIMESTAMP
+   ============================================================ */
+
+function getTelemetryTime() {
+
+    const value =
+        systemData.timestamp;
+
+
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+
+        return "--";
+
+    }
+
+
+    /*
+     * Firebase Server Timestamp may arrive as a number.
+     */
+
+    if (
+        typeof value === "number"
+    ) {
+
+        const date =
+            new Date(value);
+
+
+        if (
+            !Number.isNaN(
+                date.getTime()
+            )
+        ) {
+
+            return date.toLocaleTimeString(
+                [],
+                {
+                    hour12: false
+                }
+            );
+
+        }
+
+    }
+
+
+    /*
+     * ISO timestamp / date string.
+     */
+
+    const parsed =
+        new Date(value);
+
+
+    if (
+        !Number.isNaN(
+            parsed.getTime()
+        )
+    ) {
+
+        return parsed.toLocaleTimeString(
+            [],
+            {
+                hour12: false
+            }
+        );
+
+    }
+
+
+    /*
+     * If ESP32 sends an already formatted time,
+     * display it directly.
+     */
+
+    return String(value);
+
+}
+
+
+/* ============================================================
+   ADD POWER SAMPLE
+   ============================================================ */
+
+function appendPowerSample(power, sampleKey = null) {
+
+    const value =
+        Number(power);
+
+
+    if (
+        !Number.isFinite(value)
+    ) {
 
         return;
 
     }
 
 
-    const now = new Date();
+    /*
+     * Don't add the same Firebase update twice.
+     */
+
+    if (
+        sampleKey !== null &&
+        sampleKey === systemData.lastSampleKey
+    ) {
+
+        return;
+
+    }
 
 
-    systemData.powerHistory.push(value);
+    systemData.lastSampleKey =
+        sampleKey;
+
+
+    const label =
+        getTelemetryTime() !== "--"
+            ? getTelemetryTime()
+            : new Date().toLocaleTimeString(
+                [],
+                {
+                    hour12: false
+                }
+            );
+
+
+    systemData.powerHistory.push(
+        value
+    );
 
 
     systemData.timeLabels.push(
-
-        now.toLocaleTimeString(
-            [],
-            {
-                hour12: false
-            }
-        )
-
+        label
     );
 
 
     /*
-     * Keep the last 30 samples.
+     * Keep only the latest 30 samples.
      */
 
-    if (
+    while (
         systemData.powerHistory.length > 30
     ) {
 
@@ -183,13 +417,13 @@ function appendPowerSample(power) {
 
 
 /* ============================================================
-   APPLY FIREBASE DATA
+   APPLY FIREBASE TELEMETRY
    ============================================================ */
 
 function applyData(incoming = {}) {
 
     /*
-     * Copy Firebase values into our central data object.
+     * Copy Firebase telemetry into central data object.
      */
 
     Object.assign(
@@ -198,18 +432,54 @@ function applyData(incoming = {}) {
     );
 
 
-    systemData.mode = "firebase";
+    systemData.mode =
+        "firebase";
 
 
     /* ========================================================
-       RAM PERCENTAGE
+       STATE
+       ======================================================== */
+
+    const state =
+        normalizeState(
+            systemData.state
+        );
+
+
+    const wakeDetected =
+        state === "WAKE_DETECTED";
+
+
+    const streaming =
+        state === "STREAMING";
+
+
+    const listening =
+        state === "LISTENING";
+
+
+    /* ========================================================
+       MIC STATUS
+       ======================================================== */
+
+    const micStatus =
+        getMicStatus();
+
+
+    /* ========================================================
+       RAM
        ======================================================== */
 
     const ramLimit =
-        Number(systemData.ramLimitKb);
+        Number(
+            systemData.ramLimitKb
+        );
+
 
     const ramUsed =
-        Number(systemData.ramUsedKb);
+        Number(
+            systemData.ramUsedKb
+        );
 
 
     const ramPct =
@@ -219,203 +489,233 @@ function applyData(incoming = {}) {
 
 
     /* ========================================================
-       STATE
-       ======================================================== */
-
-    const currentState =
-        String(
-            systemData.state || ""
-        ).toUpperCase();
-
-
-    const listening =
-        currentState === "LISTENING";
-
-
-    const wakeDetected =
-        currentState === "WAKE_DETECTED" ||
-        currentState === "WAKE DETECTED";
-
-
-    const streaming =
-        currentState === "STREAMING";
-
-
-    /* ========================================================
        POWER
        ======================================================== */
 
-    const calculatedPower =
+    const power =
         calculatePower();
 
 
     /*
      * Store calculated power locally.
      *
-     * This does NOT send it back to Firebase.
+     * We intentionally DO NOT expect powerMw
+     * from Firebase.
      */
 
     systemData.powerMw =
-        calculatedPower;
+        power;
 
 
     /* ========================================================
-       BASIC CONNECTION UI
+       DEVICE
        ======================================================== */
 
-    $("deviceId").textContent =
-        systemData.deviceId;
+    setText(
+        "deviceId",
+        systemData.deviceId
+    );
 
 
-    $("sideLink").textContent =
-        "FIREBASE LIVE";
+    setText(
+        "sideLink",
+        "FIREBASE LIVE"
+    );
 
 
-    $("sideSource").textContent =
-        "FIREBASE LIVE";
+    setText(
+        "sideSource",
+        "FIREBASE LIVE"
+    );
 
 
-    $("linkStatus").textContent =
-        "LIVE";
+    setText(
+        "linkStatus",
+        "LIVE"
+    );
 
 
-    $("footerMode").textContent =
-        "FIREBASE LIVE";
+    setText(
+        "footerMode",
+        "FIREBASE LIVE"
+    );
 
 
-    $("connectionBadge").textContent =
-        "LIVE";
+    setText(
+        "connectionBadge",
+        "LIVE"
+    );
 
 
-    $("frontendMode").textContent =
-        "FIREBASE LIVE";
+    setText(
+        "frontendMode",
+        "FIREBASE LIVE"
+    );
 
 
-    $("firebasePath").textContent =
-        `devices/${systemData.deviceId}/live`;
+    setText(
+        "firebasePath",
+        `devices/${systemData.deviceId}/live`
+    );
 
 
-    $("telemetryUpdate").textContent =
-        new Date().toLocaleTimeString(
-            [],
-            {
-                hour12: false
-            }
-        );
+    /*
+     * IMPORTANT:
+     *
+     * This is now the actual telemetry timestamp,
+     * not simply the browser's current time.
+     */
+
+    setText(
+        "telemetryUpdate",
+        getTelemetryTime()
+    );
 
 
     /* ========================================================
        CPU
        ======================================================== */
 
-    $("cpu").textContent =
-        fmt(
-            systemData.cpuPercent
-        ) + "%";
-
-
     const cpu =
-        Number(systemData.cpuPercent);
+        Number(
+            systemData.cpuPercent
+        );
 
 
-    $("cpuBar").style.width =
-        Math.min(
-            Math.max(
-                cpu * 10,
-                0
-            ),
-            100
-        ) + "%";
+    setText(
+        "cpu",
+        fmt(cpu) + "%"
+    );
 
 
-    $("cpuStatus").textContent =
+    const cpuBar =
+        $("cpuBar");
+
+
+    if (cpuBar) {
+
+        cpuBar.style.width =
+            Math.min(
+                Math.max(
+                    cpu * 10,
+                    0
+                ),
+                100
+            ) + "%";
+
+    }
+
+
+    setText(
+        "cpuStatus",
         cpu < 10
             ? "TARGET STATUS // PASS"
-            : "TARGET STATUS // ABOVE LIMIT";
+            : "TARGET STATUS // ABOVE LIMIT"
+    );
 
 
     /* ========================================================
        RAM
        ======================================================== */
 
-    $("ram").textContent =
+    setText(
+        "ram",
         fmt(
-            systemData.ramUsedKb,
+            ramUsed,
             0
-        );
+        )
+    );
 
 
-    $("ramPercent").textContent =
-        fmt(
-            ramPct
-        ) + "%";
+    setText(
+        "ramPercent",
+        fmt(ramPct) + "%"
+    );
 
 
-    $("ramBar").style.width =
-        Math.min(
-            Math.max(
-                ramPct,
-                0
-            ),
-            100
-        ) + "%";
+    const ramBar =
+        $("ramBar");
+
+
+    if (ramBar) {
+
+        ramBar.style.width =
+            Math.min(
+                Math.max(
+                    ramPct,
+                    0
+                ),
+                100
+            ) + "%";
+
+    }
 
 
     /* ========================================================
        VOLTAGE
        ======================================================== */
 
-    $("voltage").textContent =
+    setText(
+        "voltage",
         fmt(
             systemData.voltage,
             2
-        ) + " V";
+        ) + " V"
+    );
 
 
     /* ========================================================
        CURRENT
        ======================================================== */
 
-    $("current").textContent =
+    setText(
+        "current",
         fmt(
             systemData.currentMa
-        ) + " mA";
+        ) + " mA"
+    );
 
 
     /* ========================================================
-       CALCULATED POWER
+       POWER
        ======================================================== */
 
-    $("power").textContent =
-        fmt(
-            calculatedPower
-        );
+    setText(
+        "power",
+        fmt(power)
+    );
 
 
-    $("powerFormula").textContent =
-        fmt(
-            calculatedPower
-        );
+    setText(
+        "powerFormula",
+        fmt(power)
+    );
 
 
-    $("powerFormulaText").textContent =
-        `${fmt(systemData.voltage, 2)} V × ${fmt(systemData.currentMa)} mA`;
+    setText(
+        "powerFormulaText",
+        `${fmt(systemData.voltage, 2)} V × ${fmt(systemData.currentMa)} mA`
+    );
 
 
     /* ========================================================
-       INFERENCE
+       KWS INFERENCE
        ======================================================== */
 
-    $("inference").textContent =
+    setText(
+        "inference",
         fmt(
             systemData.inferenceMs
-        );
+        )
+    );
 
 
-    $("latency").textContent =
+    setText(
+        "latency",
         fmt(
             systemData.inferenceMs
-        );
+        )
+    );
 
 
     /* ========================================================
@@ -428,20 +728,28 @@ function applyData(incoming = {}) {
         );
 
 
-    $("confidence").textContent =
-        fmt(
-            confidence
-        ) + "%";
+    setText(
+        "confidence",
+        fmt(confidence) + "%"
+    );
 
 
-    $("confidenceBar").style.width =
-        Math.min(
-            Math.max(
-                confidence,
-                0
-            ),
-            100
-        ) + "%";
+    const confidenceBar =
+        $("confidenceBar");
+
+
+    if (confidenceBar) {
+
+        confidenceBar.style.width =
+            Math.min(
+                Math.max(
+                    confidence,
+                    0
+                ),
+                100
+            ) + "%";
+
+    }
 
 
     /* ========================================================
@@ -454,45 +762,72 @@ function applyData(incoming = {}) {
         );
 
 
-    $("threshold").textContent =
+    setText(
+        "threshold",
         fmt(
             threshold,
             0
-        ) + "%";
+        ) + "%"
+    );
 
 
-    $("thresholdMark").style.left =
-        Math.min(
-            Math.max(
-                threshold,
-                0
-            ),
-            100
-        ) + "%";
+    const thresholdMark =
+        $("thresholdMark");
+
+
+    if (thresholdMark) {
+
+        thresholdMark.style.left =
+            Math.min(
+                Math.max(
+                    threshold,
+                    0
+                ),
+                100
+            ) + "%";
+
+    }
 
 
     /* ========================================================
-       DETECTIONS
+       DETECTION COUNTERS
        ======================================================== */
 
-    $("detections").textContent =
-        systemData.detectionsToday ?? 0;
+    setText(
+        "detections",
+        systemData.detectionsToday ?? 0
+    );
 
 
-    $("falseActivations").textContent =
-        systemData.falseActivations ?? 0;
+    setText(
+        "falseActivations",
+        systemData.falseActivations ?? 0
+    );
 
 
-    $("lastDetection").textContent =
+    setText(
+        "lastDetection",
         systemData.lastDetection ||
-        "--:--:--";
+        "--:--:--"
+    );
 
 
     /* ========================================================
-       KWS STATE
+       MICROPHONE / KWS STATE
        ======================================================== */
 
-    let displayState = "LISTENING";
+    /*
+     * STATE IS NOW DIRECTLY FROM FIREBASE.
+     *
+     * We do NOT say:
+     *
+     * confidence > threshold → WAKE DETECTED
+     *
+     * because the ESP32's KWS algorithm should make
+     * that decision.
+     */
+
+    let displayState;
 
 
     if (wakeDetected) {
@@ -518,22 +853,23 @@ function applyData(incoming = {}) {
 
     else {
 
-        /*
-         * Show whatever state Firebase sent.
-         */
-
         displayState =
-            currentState || "WAITING";
+            state
+                .replace(/_/g, " ");
 
     }
 
 
-    $("kwsState").textContent =
-        displayState;
+    setText(
+        "kwsState",
+        displayState
+    );
 
 
-    $("kwsBadge").textContent =
-        displayState;
+    setText(
+        "kwsBadge",
+        displayState
+    );
 
 
     /* ========================================================
@@ -542,22 +878,37 @@ function applyData(incoming = {}) {
 
     if (wakeDetected) {
 
-        $("modePill").textContent =
-            "WAKE EVENT ACTIVE";
+        setText(
+            "modePill",
+            "WAKE EVENT ACTIVE"
+        );
 
     }
 
     else if (streaming) {
 
-        $("modePill").textContent =
-            "ASR STREAMING";
+        setText(
+            "modePill",
+            "ASR STREAMING"
+        );
+
+    }
+
+    else if (listening) {
+
+        setText(
+            "modePill",
+            "IDLE LISTENING"
+        );
 
     }
 
     else {
 
-        $("modePill").textContent =
-            "IDLE LISTENING";
+        setText(
+            "modePill",
+            displayState
+        );
 
     }
 
@@ -568,22 +919,37 @@ function applyData(incoming = {}) {
 
     if (wakeDetected) {
 
-        $("signalState").textContent =
-            "WAKE EVENT";
+        setText(
+            "signalState",
+            "WAKE EVENT"
+        );
 
     }
 
     else if (streaming) {
 
-        $("signalState").textContent =
-            "STREAMING";
+        setText(
+            "signalState",
+            "STREAMING"
+        );
+
+    }
+
+    else if (listening) {
+
+        setText(
+            "signalState",
+            "DECISION"
+        );
 
     }
 
     else {
 
-        $("signalState").textContent =
-            "DECISION";
+        setText(
+            "signalState",
+            displayState
+        );
 
     }
 
@@ -594,91 +960,136 @@ function applyData(incoming = {}) {
 
     if (wakeDetected) {
 
-        $("eventSignal").textContent =
-            "TRIGGERED";
+        setText(
+            "eventSignal",
+            "TRIGGERED"
+        );
 
     }
 
     else if (streaming) {
 
-        $("eventSignal").textContent =
-            "STREAMING";
+        setText(
+            "eventSignal",
+            "STREAMING"
+        );
+
+    }
+
+    else if (listening) {
+
+        setText(
+            "eventSignal",
+            "ARMED"
+        );
 
     }
 
     else {
 
-        $("eventSignal").textContent =
-            "ARMED";
+        setText(
+            "eventSignal",
+            "WAITING"
+        );
 
     }
 
 
     /* ========================================================
-       EVENT TEXT
+       EVENT MESSAGE
        ======================================================== */
 
     if (wakeDetected) {
 
-        $("eventText").textContent =
-            "KEYWORD DETECTED — START ASR";
+        setText(
+            "eventText",
+            "KEYWORD DETECTED — START ASR"
+        );
 
 
-        $("eventSubtext").textContent =
-            `Confidence ${fmt(confidence)}%`;
+        setText(
+            "eventSubtext",
+            `Confidence ${fmt(confidence)}%`
+        );
 
     }
 
     else if (streaming) {
 
-        $("eventText").textContent =
-            "AUDIO STREAMING TO ASR";
+        setText(
+            "eventText",
+            "AUDIO STREAMING TO ASR"
+        );
 
 
-        $("eventSubtext").textContent =
-            "Remote processing active";
+        setText(
+            "eventSubtext",
+            "Remote processing active"
+        );
+
+    }
+
+    else if (listening) {
+
+        setText(
+            "eventText",
+            "LISTENING FOR WAKE PHRASE"
+        );
+
+
+        setText(
+            "eventSubtext",
+            `Microphone ${micStatus}`
+        );
 
     }
 
     else {
 
-        $("eventText").textContent =
-            "LISTENING FOR WAKE PHRASE";
+        setText(
+            "eventText",
+            displayState
+        );
 
 
-        $("eventSubtext").textContent =
-            "No keyword event detected";
+        setText(
+            "eventSubtext",
+            `Microphone ${micStatus}`
+        );
 
     }
 
 
     /* ========================================================
-       VISUAL DETECTION STATE
+       VISUAL DETECTION
        ======================================================== */
 
-    $("eventIndicator")
-        .classList
-        .toggle(
+    const eventIndicator =
+        $("eventIndicator");
+
+
+    if (eventIndicator) {
+
+        eventIndicator.classList.toggle(
             "detected",
             wakeDetected || streaming
         );
 
+    }
 
-    $("reactor")
-        .classList
-        .toggle(
+
+    const reactor =
+        $("reactor");
+
+
+    if (reactor) {
+
+        reactor.classList.toggle(
             "detected",
             wakeDetected || streaming
         );
 
-
-    /* ========================================================
-       DEMO / LIVE BANNER
-       ======================================================== */
-
-    $("demoBanner").innerHTML =
-        "● FIREBASE LIVE TELEMETRY " +
-        "<span>— values below are read directly from Firebase Realtime Database</span>";
+    }
 
 
     /* ========================================================
@@ -686,20 +1097,19 @@ function applyData(incoming = {}) {
        ======================================================== */
 
     /*
-     * Add the newly calculated power value.
+     * Use Firebase/ESP32 timestamp as the sample identity
+     * whenever possible.
      */
 
-    if (
-        Number.isFinite(
-            calculatedPower
-        )
-    ) {
+    const sampleKey =
+        systemData.timestamp ||
+        `${systemData.voltage}-${systemData.currentMa}`;
 
-        appendPowerSample(
-            calculatedPower
-        );
 
-    }
+    appendPowerSample(
+        power,
+        sampleKey
+    );
 
 
     /* ========================================================
@@ -739,33 +1149,54 @@ function applyData(incoming = {}) {
             );
 
 
-        $("powerAvg").textContent =
-            fmt(
-                average
-            );
+        setText(
+            "powerAvg",
+            fmt(average)
+        );
 
 
-        $("powerRange").textContent =
-            `${fmt(minimum)}–${fmt(maximum)}`;
+        setText(
+            "powerRange",
+            `${fmt(minimum)}–${fmt(maximum)}`
+        );
 
     }
 
     else {
 
-        $("powerAvg").textContent =
-            fmt(
-                calculatedPower
-            );
+        setText(
+            "powerAvg",
+            fmt(power)
+        );
 
 
-        $("powerRange").textContent =
-            "--";
+        setText(
+            "powerRange",
+            "--"
+        );
 
     }
 
 
     /* ========================================================
-       UPDATE POWER CHART
+       LIVE BANNER
+       ======================================================== */
+
+    const demoBanner =
+        $("demoBanner");
+
+
+    if (demoBanner) {
+
+        demoBanner.innerHTML =
+            "● FIREBASE LIVE TELEMETRY " +
+            "<span>— values below are read directly from Firebase Realtime Database</span>";
+
+    }
+
+
+    /* ========================================================
+       UPDATE CHART
        ======================================================== */
 
     updatePowerChart();
@@ -779,10 +1210,6 @@ function applyData(incoming = {}) {
 
 let powerChart = null;
 
-
-/* ============================================================
-   UPDATE POWER CHART
-   ============================================================ */
 
 function updatePowerChart() {
 
@@ -1022,27 +1449,28 @@ function updateClock() {
         new Date();
 
 
-    $("clock").textContent =
+    setText(
+        "clock",
         now.toLocaleTimeString(
             [],
             {
                 hour12: false
             }
-        );
+        )
+    );
 
 
-    $("date").textContent =
+    setText(
+        "date",
         now.toLocaleDateString(
             [],
             {
                 month: "short",
-
                 day: "2-digit",
-
                 year: "numeric"
-
             }
-        );
+        )
+    );
 
 }
 
@@ -1105,11 +1533,17 @@ function initNavigation() {
                         }
 
 
-                        $("sidebar")
-                            .classList
-                            .remove(
+                        const sidebar =
+                            $("sidebar");
+
+
+                        if (sidebar) {
+
+                            sidebar.classList.remove(
                                 "open"
                             );
+
+                        }
 
                     }
                 );
@@ -1128,11 +1562,17 @@ function initNavigation() {
             "click",
             () => {
 
-                $("sidebar")
-                    .classList
-                    .toggle(
+                const sidebar =
+                    $("sidebar");
+
+
+                if (sidebar) {
+
+                    sidebar.classList.toggle(
                         "open"
                     );
+
+                }
 
             }
         );
@@ -1143,7 +1583,7 @@ function initNavigation() {
 
 
 /* ============================================================
-   FIREBASE CONNECTION
+   FIREBASE INITIALIZATION
    ============================================================ */
 
 async function initializeFirebase() {
@@ -1152,25 +1592,33 @@ async function initializeFirebase() {
         !window.EdgeKWSFirebase
     ) {
 
-        console.warn(
+        console.error(
             "EdgeKWSFirebase adapter not found."
         );
 
-        $("demoBanner").innerHTML =
-            "! FIREBASE ADAPTER NOT FOUND " +
-            "<span>— check firebase-service.js</span>";
+
+        setText(
+            "demoBanner",
+            "FIREBASE ADAPTER NOT FOUND"
+        );
 
 
-        $("connectionBadge").textContent =
-            "ERROR";
+        setText(
+            "connectionBadge",
+            "ERROR"
+        );
 
 
-        $("frontendMode").textContent =
-            "ADAPTER ERROR";
+        setText(
+            "frontendMode",
+            "ADAPTER ERROR"
+        );
 
 
-        $("linkStatus").textContent =
-            "ERROR";
+        setText(
+            "linkStatus",
+            "ERROR"
+        );
 
 
         return;
@@ -1188,10 +1636,14 @@ async function initializeFirebase() {
                 data => {
 
                     /*
-                     * Firebase sent new telemetry.
+                     * =================================================
+                     * FIREBASE UPDATE RECEIVED
+                     * =================================================
                      */
 
-                    if (!data) {
+                    if (
+                        !data
+                    ) {
 
                         return;
 
@@ -1199,9 +1651,7 @@ async function initializeFirebase() {
 
 
                     /*
-                     * Copy Firebase data.
-                     *
-                     * No random/demo data is added.
+                     * Create a clean copy.
                      */
 
                     const incoming =
@@ -1210,9 +1660,9 @@ async function initializeFirebase() {
                         };
 
 
-                    /*
-                     * Convert numeric fields safely.
-                     */
+                    /* ================================================
+                       NUMERIC FIELDS
+                       ================================================ */
 
                     const numericFields = [
 
@@ -1273,18 +1723,96 @@ async function initializeFirebase() {
                     );
 
 
+                    /* ================================================
+                       STATE
+                       ================================================ */
+
+                    if (
+                        incoming.state !== undefined &&
+                        incoming.state !== null
+                    ) {
+
+                        incoming.state =
+                            String(
+                                incoming.state
+                            );
+
+                    }
+
+
+                    /* ================================================
+                       MICROPHONE STATUS
+                       ================================================ */
+
+                    if (
+                        incoming.micStatus !== undefined &&
+                        incoming.micStatus !== null
+                    ) {
+
+                        incoming.micStatus =
+                            String(
+                                incoming.micStatus
+                            );
+
+                    }
+
+
+                    /* ================================================
+                       TIMESTAMP
+                       ================================================ */
+
                     /*
-                     * IMPORTANT:
+                     * Support several possible field names so you
+                     * don't need to rewrite the dashboard later.
                      *
-                     * We deliberately do NOT read:
+                     * Preferred:
                      *
-                     * incoming.powerMw
+                     * timestamp
                      *
-                     * because power is calculated from:
+                     * Also accepted:
                      *
-                     * voltage × currentMa
+                     * lastUpdate
+                     * updatedAt
+                     * time
                      */
 
+                    if (
+                        incoming.timestamp === undefined
+                    ) {
+
+                        if (
+                            incoming.lastUpdate !== undefined
+                        ) {
+
+                            incoming.timestamp =
+                                incoming.lastUpdate;
+
+                        }
+
+                        else if (
+                            incoming.updatedAt !== undefined
+                        ) {
+
+                            incoming.timestamp =
+                                incoming.updatedAt;
+
+                        }
+
+                        else if (
+                            incoming.time !== undefined
+                        ) {
+
+                            incoming.timestamp =
+                                incoming.time;
+
+                        }
+
+                    }
+
+
+                    /*
+                     * Apply actual Firebase telemetry.
+                     */
 
                     applyData(
                         incoming
@@ -1297,29 +1825,47 @@ async function initializeFirebase() {
 
         if (!connected) {
 
-            $("demoBanner").innerHTML =
-                "! FIREBASE NOT CONFIGURED " +
-                "<span>— check firebase-config.js</span>";
+            const banner =
+                $("demoBanner");
 
 
-            $("connectionBadge").textContent =
-                "OFFLINE";
+            if (banner) {
+
+                banner.innerHTML =
+                    "! FIREBASE NOT CONFIGURED " +
+                    "<span>— check firebase-config.js</span>";
+
+            }
 
 
-            $("frontendMode").textContent =
-                "CONFIG REQUIRED";
+            setText(
+                "connectionBadge",
+                "OFFLINE"
+            );
 
 
-            $("linkStatus").textContent =
-                "OFFLINE";
+            setText(
+                "frontendMode",
+                "CONFIG REQUIRED"
+            );
 
 
-            $("sideLink").textContent =
-                "OFFLINE";
+            setText(
+                "linkStatus",
+                "OFFLINE"
+            );
 
 
-            $("sideSource").textContent =
-                "NOT CONNECTED";
+            setText(
+                "sideLink",
+                "OFFLINE"
+            );
+
+
+            setText(
+                "sideSource",
+                "NOT CONNECTED"
+            );
 
 
             return;
@@ -1336,29 +1882,47 @@ async function initializeFirebase() {
         );
 
 
-        $("demoBanner").innerHTML =
-            "! FIREBASE CONNECTION ERROR " +
-            "<span>— check Firebase configuration and database rules</span>";
+        const banner =
+            $("demoBanner");
 
 
-        $("connectionBadge").textContent =
-            "ERROR";
+        if (banner) {
+
+            banner.innerHTML =
+                "! FIREBASE CONNECTION ERROR " +
+                "<span>— check Firebase configuration and Realtime Database rules</span>";
+
+        }
 
 
-        $("frontendMode").textContent =
-            "CONNECTION ERROR";
+        setText(
+            "connectionBadge",
+            "ERROR"
+        );
 
 
-        $("linkStatus").textContent =
-            "ERROR";
+        setText(
+            "frontendMode",
+            "CONNECTION ERROR"
+        );
 
 
-        $("sideLink").textContent =
-            "ERROR";
+        setText(
+            "linkStatus",
+            "ERROR"
+        );
 
 
-        $("sideSource").textContent =
-            "FIREBASE ERROR";
+        setText(
+            "sideLink",
+            "ERROR"
+        );
+
+
+        setText(
+            "sideSource",
+            "FIREBASE ERROR"
+        );
 
     }
 
@@ -1366,7 +1930,7 @@ async function initializeFirebase() {
 
 
 /* ============================================================
-   APPLICATION START
+   START APPLICATION
    ============================================================ */
 
 window.addEventListener(
@@ -1381,7 +1945,10 @@ window.addEventListener(
 
 
         /*
-         * Clock
+         * Browser clock.
+         *
+         * This is only the current browser time.
+         * It is NOT used as telemetry update time.
          */
 
         updateClock();
@@ -1394,14 +1961,14 @@ window.addEventListener(
 
 
         /*
-         * Chart
+         * Power chart.
          */
 
         initPowerChart();
 
 
         /*
-         * Firebase
+         * Firebase.
          */
 
         await initializeFirebase();
